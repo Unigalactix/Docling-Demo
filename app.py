@@ -9,6 +9,7 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("HF_HUB_DISABLE_HARDLINKS", "1")
 
+from dotenv import load_dotenv
 import streamlit as st
 from docling.document_converter import DocumentConverter, InputFormat
 
@@ -103,6 +104,9 @@ st.title("📄 Docling Streamlit Converter")
 st.caption(
     "Upload a document (PDF, DOCX, PPTX, XLSX, HTML, images, etc.) and export to Markdown, HTML, DocTags, or lossless JSON."
 )
+
+# Load environment variables from .env (e.g., OPENROUTER_API_KEY)
+load_dotenv()
 
 with st.expander("Advanced (optional)"):
     col1, col2 = st.columns(2)

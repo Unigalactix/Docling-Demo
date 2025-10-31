@@ -17,6 +17,9 @@ models/
 # Streamlit
 .streamlit/secrets.toml
 
+# Local environment variables
+.env
+
 # OS files
 Thumbs.db
 Desktop.ini
