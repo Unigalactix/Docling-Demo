@@ -1,0 +1,3 @@
+docling
+streamlit
+pillow

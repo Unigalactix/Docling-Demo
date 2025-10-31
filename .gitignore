@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env
+.venv/
+venv/
+
+# Local caches and models
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+models/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS files
+Thumbs.db
+Desktop.ini
