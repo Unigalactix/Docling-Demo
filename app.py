@@ -4,12 +4,14 @@ import json
 import re
 import tempfile
 from pathlib import Path
+from typing import Any, Dict
 
 # Robust HF Hub settings for Windows (avoid symlink/hardlink issues)
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("HF_HUB_DISABLE_HARDLINKS", "1")
 
 from dotenv import load_dotenv
+import requests
 import streamlit as st
 from docling.document_converter import DocumentConverter, InputFormat
 
@@ -47,6 +49,117 @@ def doc_to_outputs(doc):
     js = doc.export_to_dict()
     json_text = json.dumps(js, ensure_ascii=False, indent=2)
     return md, html, doctags, json_text
+
+
+def _truncate(text: str, max_chars: int = 120_000) -> str:
+    if text is None:
+        return ""
+    return text if len(text) <= max_chars else text[:max_chars] + "\n... [truncated]"
+
+
+def _openrouter_endpoint() -> str:
+    base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    return base.rstrip("/") + "/chat/completions"
+
+
+def _openrouter_model() -> str:
+    return os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+
+
+def _openrouter_headers() -> Dict[str, str]:
+    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    # Optional but recommended headers per OpenRouter docs
+    referer = os.getenv("OPENROUTER_HTTP_REFERER", "")
+    if referer:
+        headers["HTTP-Referer"] = referer
+    title = os.getenv("OPENROUTER_X_TITLE", "")
+    if title:
+        headers["X-Title"] = title
+    return headers
+
+
+def ai_fill_template_via_openrouter(template: Dict[str, Any], doc_json: Dict[str, Any], doc_text: str | None = None, temperature: float = 0.0) -> Dict[str, Any]:
+    """
+    Use an LLM (via OpenRouter) to map values from doc_json into the template structure.
+    Rules:
+      - Preserve all keys and nesting from the template.
+      - Replace any leaf value equal to the literal string "string" with best-matched value from doc_json.
+      - If not found, use an empty string "".
+      - Do not invent content not present in doc_json; prefer exact strings/numbers.
+    """
+
+    endpoint = _openrouter_endpoint()
+    model = _openrouter_model()
+    headers = _openrouter_headers()
+    if "Authorization" not in headers:
+        raise RuntimeError("OPENROUTER_API_KEY is not set in environment/.env")
+
+    # Prepare compact inputs for the prompt
+    tpl_str = json.dumps(template, ensure_ascii=False, indent=2)
+    src_json_str = json.dumps(doc_json, ensure_ascii=False)
+    src_json_str = _truncate(src_json_str)
+    doc_text_str = _truncate(doc_text or "")
+
+    system_prompt = (
+        "You are a precise JSON transformation assistant. "
+        "Your job is to fill a target JSON template using ONLY values present in a provided source JSON (and TEXT as tie-breaker). "
+        "Preserve every key and structure from the template. Replace only leaf values equal to the exact string 'string'. "
+        "If a value cannot be determined from the source, set it to an empty string ''. "
+        "Do not hallucinate or invent values. Return strictly valid JSON with no commentary."
+    )
+
+    user_prompt = (
+        "TARGET TEMPLATE (preserve structure, replace 'string' leaves):\n" +
+        f"```json\n{tpl_str}\n```\n\n" +
+        "SOURCE JSON (extracted by Docling):\n" +
+        f"```json\n{src_json_str}\n```\n\n" +
+        "OPTIONAL PLAIN TEXT (fallback only if clearly matches a template field):\n" +
+        f"```text\n{doc_text_str}\n```\n\n" +
+        "Return ONLY the filled JSON object."
+    )
+
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    resp = requests.post(endpoint, headers=headers, json=payload, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # OpenRouter returns OpenAI-compatible schema
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if not content:
+        raise RuntimeError("Empty response from AI")
+
+    # Try direct JSON parse
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to extract JSON between code fences
+    fence_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", content)
+    if fence_match:
+        fenced = fence_match.group(1)
+        return json.loads(fenced)
+
+    # Last attempt: find first JSON object substring
+    brace_start = content.find("{")
+    brace_end = content.rfind("}")
+    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+        return json.loads(content[brace_start:brace_end+1])
+
+    raise RuntimeError("AI response was not valid JSON")
 
 
 def camel_to_words(name: str) -> str:
@@ -187,7 +300,7 @@ if uploaded is not None:
         )
         st.code(json_text, language="json")
 
-    # Template-based JSON filling (uses project master.json by default)
+    # Template-based JSON filling (AI via OpenRouter, with heuristic fallback)
     with tabs[4]:
         st.subheader("Fill JSON from Template (master.json)")
 
@@ -217,10 +330,30 @@ if uploaded is not None:
             st.error(f"Invalid template JSON: {e}")
             st.stop()
 
-        # Extract plain text from doc for matching
+        # Prepare sources
         doc_text = doc.export_to_text()
+        doc_lossless = json.loads(json_text)
 
-        filled = fill_template_from_text(template, doc_text)
+        method_options = ["AI (OpenRouter)", "Heuristic (regex)"]
+        has_key = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+        default_index = 0 if has_key else 1
+        method = st.radio("Filling method", method_options, index=default_index, horizontal=True)
+
+        if method == "AI (OpenRouter)":
+            if not has_key:
+                st.warning("OPENROUTER_API_KEY not set. Using heuristic fallback.")
+                filled = fill_template_from_text(template, doc_text)
+            else:
+                with st.spinner("Asking AI to map Docling JSON to template via OpenRouter…"):
+                    try:
+                        filled = ai_fill_template_via_openrouter(template, doc_lossless, doc_text)
+                    except Exception as e:
+                        st.error(f"AI filling failed: {type(e).__name__}: {e}")
+                        st.info("Falling back to heuristic method.")
+                        filled = fill_template_from_text(template, doc_text)
+        else:
+            filled = fill_template_from_text(template, doc_text)
+
         filled_text = json.dumps(filled, ensure_ascii=False, indent=2)
 
         st.download_button(

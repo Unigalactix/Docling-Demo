@@ -2,3 +2,4 @@ docling
 streamlit
 pillow
 python-dotenv
+requests
