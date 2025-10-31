@@ -83,14 +83,14 @@ def _openrouter_headers() -> Dict[str, str]:
     return headers
 
 
-def ai_fill_template_via_openrouter(template: Dict[str, Any], doc_json: Dict[str, Any], doc_text: str | None = None, temperature: float = 0.0) -> Dict[str, Any]:
+def ai_fill_template_via_openrouter_from_markdown(template: Dict[str, Any], markdown_text: str, temperature: float = 0.0) -> Dict[str, Any]:
     """
-    Use an LLM (via OpenRouter) to map values from doc_json into the template structure.
+    Use an LLM (via OpenRouter) to map values from the document's Markdown into the template structure.
     Rules:
       - Preserve all keys and nesting from the template.
-      - Replace any leaf value equal to the literal string "string" with best-matched value from doc_json.
-      - If not found, use an empty string "".
-      - Do not invent content not present in doc_json; prefer exact strings/numbers.
+      - Replace any leaf value equal to the literal string "string" OR null with best-matched value from the Markdown.
+      - If not found, set the value to null.
+      - Do not invent content not present in the Markdown; prefer exact strings/numbers.
     """
 
     endpoint = _openrouter_endpoint()
@@ -101,25 +101,21 @@ def ai_fill_template_via_openrouter(template: Dict[str, Any], doc_json: Dict[str
 
     # Prepare compact inputs for the prompt
     tpl_str = json.dumps(template, ensure_ascii=False, indent=2)
-    src_json_str = json.dumps(doc_json, ensure_ascii=False)
-    src_json_str = _truncate(src_json_str)
-    doc_text_str = _truncate(doc_text or "")
+    md_str = _truncate(markdown_text or "")
 
     system_prompt = (
         "You are a precise JSON transformation assistant. "
-        "Your job is to fill a target JSON template using ONLY values present in a provided source JSON (and TEXT as tie-breaker). "
-        "Preserve every key and structure from the template. Replace only leaf values equal to the exact string 'string'. "
-        "If a value cannot be determined from the source, set it to an empty string ''. "
+        "Your job is to fill a target JSON template using ONLY values present in a provided MARKDOWN content derived from the document. "
+        "Preserve every key and structure from the template. Replace only leaf values equal to the exact string 'string' or null. "
+        "If a value cannot be determined from the markdown, set it to null. "
         "Do not hallucinate or invent values. Return strictly valid JSON with no commentary."
     )
 
     user_prompt = (
-        "TARGET TEMPLATE (preserve structure, replace 'string' leaves):\n" +
+        "TARGET TEMPLATE (preserve structure, replace 'string' or null leaves):\n" +
         f"```json\n{tpl_str}\n```\n\n" +
-        "SOURCE JSON (extracted by Docling):\n" +
-        f"```json\n{src_json_str}\n```\n\n" +
-        "OPTIONAL PLAIN TEXT (fallback only if clearly matches a template field):\n" +
-        f"```text\n{doc_text_str}\n```\n\n" +
+        "SOURCE MARKDOWN (extracted by Docling; use exact values only):\n" +
+        f"```markdown\n{md_str}\n```\n\n" +
         "Return ONLY the filled JSON object."
     )
 
@@ -196,13 +192,15 @@ def extract_value_from_text(label: str, text: str) -> str | None:
 
 
 def fill_template_from_text(obj, text: str):
-    # Recursively fill any leaf value equal to the literal string "string"
+    # Recursively fill any leaf value equal to the literal string "string" OR null.
+    # If a value cannot be extracted, keep null (None) instead of an empty string.
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            if isinstance(v, str) and v == "string":
+            is_placeholder = (isinstance(v, str) and v == "string") or (v is None)
+            if is_placeholder:
                 found = extract_value_from_text(k, text)
-                out[k] = found if found is not None else ""
+                out[k] = found if found is not None else None
             else:
                 out[k] = fill_template_from_text(v, text)
         return out
@@ -330,9 +328,8 @@ if uploaded is not None:
             st.error(f"Invalid template JSON: {e}")
             st.stop()
 
-        # Prepare sources
-        doc_text = doc.export_to_text()
-        doc_lossless = json.loads(json_text)
+        # Prepare source: use generated Markdown for extraction
+        md_source = md
 
         method_options = ["AI (OpenRouter)", "Heuristic (regex)"]
         has_key = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
@@ -342,17 +339,17 @@ if uploaded is not None:
         if method == "AI (OpenRouter)":
             if not has_key:
                 st.warning("OPENROUTER_API_KEY not set. Using heuristic fallback.")
-                filled = fill_template_from_text(template, doc_text)
+                filled = fill_template_from_text(template, md_source)
             else:
-                with st.spinner("Asking AI to map Docling JSON to template via OpenRouter…"):
+                with st.spinner("Asking AI to map Markdown to template via OpenRouter…"):
                     try:
-                        filled = ai_fill_template_via_openrouter(template, doc_lossless, doc_text)
+                        filled = ai_fill_template_via_openrouter_from_markdown(template, md_source)
                     except Exception as e:
                         st.error(f"AI filling failed: {type(e).__name__}: {e}")
                         st.info("Falling back to heuristic method.")
-                        filled = fill_template_from_text(template, doc_text)
+                        filled = fill_template_from_text(template, md_source)
         else:
-            filled = fill_template_from_text(template, doc_text)
+            filled = fill_template_from_text(template, md_source)
 
         filled_text = json.dumps(filled, ensure_ascii=False, indent=2)
 

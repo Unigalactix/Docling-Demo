@@ -33,7 +33,7 @@ Then open the printed local URL (e.g., http://localhost:8501) in your browser, u
 
 ## AI template filling (OpenRouter)
 
-The Template Fill tab lets you populate your own `master.json`-style template using data extracted by Docling. By default, the app will use AI via OpenRouter if an API key is available; otherwise it falls back to a simple label-based heuristic.
+The Template Fill tab lets you populate your own `master.json`-style template using data extracted by Docling's generated Markdown. By default, the app will use AI via OpenRouter if an API key is available; otherwise it falls back to a simple label-based heuristic.
 
 1) Create a local `.env` file (not committed):
 
@@ -55,9 +55,9 @@ OPENROUTER_API_KEY=sk-or-...
 
 Behavior and guarantees:
 - The AI is instructed to preserve the exact structure and keys of your template
-- It replaces only leaf values equal to the literal string `"string"`
-- If a value cannot be found in Docling's lossless JSON, it sets an empty string
-- It should not invent information; it uses Docling JSON (and plain text as a last resort)
+- It replaces only leaf values equal to the literal `"string"` or `null`
+- If a value cannot be found in the Markdown, it sets the value to `null`
+- It should not invent information; it uses the Markdown as the single source of truth
 
 Notes on privacy and cost:
 - Using AI sends the document-derived JSON (and a truncated plain-text view) to OpenRouter and the selected model provider. Review your data policies before enabling.
