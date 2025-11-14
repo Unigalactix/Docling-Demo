@@ -34,10 +34,26 @@ def save_upload_to_temp(uploaded_file) -> Path:
     return Path(tmp.name)
 
 
-def convert_file(path: Path):
+def convert_file(path: Path, page_range: str | None = "", max_pages: int = 0):
     converter = get_converter()
-    result = converter.convert(str(path))
-    return result
+    kwargs: Dict[str, Any] = {}
+    if page_range:
+        kwargs["page_range"] = page_range
+    if isinstance(max_pages, int) and max_pages > 0:
+        kwargs["max_pages"] = max_pages
+
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".pdf":
+            try:
+                return converter.convert(str(path), input_format=InputFormat.PDF, **kwargs)
+            except TypeError:
+                # Older versions may not accept input_format; fall back
+                pass
+        return converter.convert(str(path), **kwargs)
+    except Exception:
+        # Retry once with no kwargs as a safety net
+        return converter.convert(str(path))
 
 
 def doc_to_outputs(doc):
@@ -83,16 +99,167 @@ def _openrouter_headers() -> Dict[str, str]:
     return headers
 
 
+def _chat_system_prompt() -> str:
+    return (
+        "You are a precise assistant for question answering grounded ONLY in the provided DOCUMENT CONTEXT. "
+        "Use the context verbatim; if the answer is not present, say you don't know. "
+        "Cite short quotes from the context when helpful. Be concise and accurate."
+    )
+
+
+def ai_answer_from_context_via_openai(context_md: str, question: str, temperature: float = 0.0) -> str:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not set in environment/.env")
+    endpoint = "https://api.openai.com/v1/chat/completions"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+    sys_prompt = _chat_system_prompt()
+    ctx = _truncate(context_md or "")
+    user = (
+        "DOCUMENT CONTEXT (Markdown):\n" +
+        f"```markdown\n{ctx}\n```\n\n" +
+        f"QUESTION: {question}\n\n" +
+        "Answer strictly using the context above."
+    )
+    payload = {
+        "model": openai_model,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user},
+        ],
+    }
+    resp = requests.post(endpoint, headers=headers, json=payload, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    if not content:
+        raise RuntimeError("Empty response from OpenAI")
+    return content
+
+
+def ai_answer_from_context_via_openrouter(context_md: str, question: str, temperature: float = 0.0) -> str:
+    endpoint = _openrouter_endpoint()
+    model = _openrouter_model()
+    headers = _openrouter_headers()
+    if "Authorization" not in headers:
+        raise RuntimeError("OPENROUTER_API_KEY is not set in environment/.env")
+    sys_prompt = _chat_system_prompt()
+    ctx = _truncate(context_md or "")
+    user = (
+        "DOCUMENT CONTEXT (Markdown):\n" +
+        f"```markdown\n{ctx}\n```\n\n" +
+        f"QUESTION: {question}\n\n" +
+        "Answer strictly using the context above."
+    )
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user},
+        ],
+    }
+    resp = requests.post(endpoint, headers=headers, json=payload, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+
+def ai_chat_answer_with_fallback(context_md: str, question: str, temperature: float = 0.0) -> tuple[str, str]:
+    try:
+        return ai_answer_from_context_via_openai(context_md, question, temperature), "openai"
+    except Exception as e:
+        print(f"OpenAI chat failed: {e}; trying OpenRouter…")
+        return ai_answer_from_context_via_openrouter(context_md, question, temperature), "openrouter"
+
+
+def ai_fill_template_via_openai_from_markdown(template: Dict[str, Any], markdown_text: str, temperature: float = 0.0) -> Dict[str, Any]:
+    """
+    Use OpenAI API to fill template from markdown. Returns filled template or raises Exception.
+    """
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not set in environment/.env")
+    endpoint = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
+    }
+    tpl_str = json.dumps(template, ensure_ascii=False, indent=2)
+    md_str = _truncate(markdown_text or "")
+    system_prompt = (
+        "You are a precise JSON transformation assistant. "
+        "Your job is to fill a target JSON template using ONLY values present in a provided MARKDOWN content derived from the document. "
+        "Preserve every key and structure from the template. Replace only leaf values equal to the exact string 'string' or null. "
+        "If a value cannot be determined from the markdown, set it to null. "
+        "Do not hallucinate or invent values. Return strictly valid JSON with no commentary."
+    )
+    user_prompt = (
+        "TARGET TEMPLATE (preserve structure, replace 'string' or null leaves):\n" +
+        f"```json\n{tpl_str}\n```\n\n" +
+        "SOURCE MARKDOWN (extracted by Docling; use exact values only):\n" +
+        f"```markdown\n{md_str}\n```\n\n" +
+        "Return ONLY the filled JSON object."
+    )
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+    payload = {
+        "model": openai_model,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    resp = requests.post(endpoint, headers=headers, json=payload, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if not content:
+        raise RuntimeError("Empty response from OpenAI")
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    fence_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", content)
+    if fence_match:
+        fenced = fence_match.group(1)
+        return json.loads(fenced)
+    brace_start = content.find("{")
+    brace_end = content.rfind("}")
+    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+        return json.loads(content[brace_start:brace_end+1])
+    raise RuntimeError("OpenAI response was not valid JSON")
+
+def ai_fill_template_with_fallback(template: Dict[str, Any], markdown_text: str, temperature: float = 0.0) -> Dict[str, Any]:
+    """
+    Maintained for backward-compat: returns only the filled JSON.
+    """
+    filled, _ = ai_fill_template_with_fallback_and_provider(template, markdown_text, temperature)
+    return filled
+
+
+def ai_fill_template_with_fallback_and_provider(template: Dict[str, Any], markdown_text: str, temperature: float = 0.0) -> tuple[Dict[str, Any], str]:
+    """
+    Try OpenAI first, fallback to OpenRouter; returns (filled_json, provider_used).
+    provider_used in {"openai", "openrouter"}.
+    """
+    try:
+        return ai_fill_template_via_openai_from_markdown(template, markdown_text, temperature), "openai"
+    except Exception as e:
+        print(f"OpenAI failed: {e}. Trying OpenRouter...")
+        try:
+            return ai_fill_template_via_openrouter_from_markdown(template, markdown_text, temperature), "openrouter"
+        except Exception as e2:
+            print(f"OpenRouter also failed: {e2}")
+            raise RuntimeError(f"Both OpenAI and OpenRouter failed: {e2}")
+
+
 def ai_fill_template_via_openrouter_from_markdown(template: Dict[str, Any], markdown_text: str, temperature: float = 0.0) -> Dict[str, Any]:
     """
-    Use an LLM (via OpenRouter) to map values from the document's Markdown into the template structure.
-    Rules:
-      - Preserve all keys and nesting from the template.
-      - Replace any leaf value equal to the literal string "string" OR null with best-matched value from the Markdown.
-      - If not found, set the value to null.
-      - Do not invent content not present in the Markdown; prefer exact strings/numbers.
+    Use an LLM (via OpenRouter) to map values from the document's Markdown into the template structure. Rules: Preserve all keys and nesting from the template. Replace any leaf value equal to the literal string 'string' OR null with best-matched value from the Markdown. If not found, set the value to null. Do not invent content not present in the Markdown; prefer exact strings/numbers.
     """
-
     endpoint = _openrouter_endpoint()
     model = _openrouter_model()
     headers = _openrouter_headers()
@@ -211,39 +378,32 @@ def fill_template_from_text(obj, text: str):
         return obj
 
 
-st.title("📄 Docling Streamlit Converter")
-st.caption(
-    "Upload a document (PDF, DOCX, PPTX, XLSX, HTML, images, etc.) and export to Markdown, HTML, DocTags, or lossless JSON."
-)
+st.title("📄 Docling Chat with Documents")
+st.caption("Upload documents (PDF, DOCX, PPTX, images, etc.). Docling extracts text; then ask questions in chat.")
 
 # Load environment variables from .env (e.g., OPENROUTER_API_KEY)
 load_dotenv()
 
-with st.expander("Advanced (optional)"):
-    col1, col2 = st.columns(2)
-    with col1:
-        max_pages = st.number_input("Max pages to process (0 = no limit)", min_value=0, value=0, step=1)
-    with col2:
-        page_range = st.text_input("Page range (e.g. 1-3,5). Leave empty for all.", value="")
-    st.caption("Leave defaults if unsure. Advanced options are applied best-effort.")
+with st.sidebar:
+    st.subheader("Upload")
+    max_pages = st.number_input("Max pages (0 = all)", min_value=0, value=0, step=1, help="Process limit for very large files")
+    page_range = st.text_input("Page range (e.g. 1-3,5)", value="")
+    st.caption("Leave defaults if unsure.")
 
-uploaded = st.file_uploader(
+uploaded = st.sidebar.file_uploader(
     "Choose a file",
-    type=[
-        "pdf", "docx", "pptx", "xlsx", "html", "htm", "md",
-        "png", "jpg", "jpeg", "tif", "tiff", "csv", "vtt"
-    ],
+    type=["pdf", "docx", "pptx", "xlsx", "html", "htm", "md", "png", "jpg", "jpeg", "tif", "tiff", "csv", "vtt"],
 )
+process_btn = st.sidebar.button("Process Document", type="primary", disabled=(uploaded is None))
 
-if uploaded is not None:
+if uploaded is not None and process_btn:
     tmp_path = save_upload_to_temp(uploaded)
     st.info(f"Saved upload to temporary file: {tmp_path.name}")
 
     with st.spinner("Converting with Docling… (downloads models on first run)"):
         try:
-            # Apply simple page controls if provided (Docling supports page_range in convert())
-            # For simplicity, we call convert() without custom options; advanced tuning can be added later.
-            result = convert_file(tmp_path)
+            # Apply page controls when provided (best-effort depending on Docling version)
+            result = convert_file(tmp_path, page_range=page_range, max_pages=max_pages)
         except Exception as e:
             st.error(f"Conversion failed: {type(e).__name__}: {e}")
             st.stop()
@@ -254,115 +414,48 @@ if uploaded is not None:
                 st.write(str(err))
 
     doc = result.document
-    st.success("Conversion complete.")
-    st.write(f"Pages detected: {len(result.pages)} | Status: {result.status}")
-
     md, html, doctags, json_text = doc_to_outputs(doc)
 
-    tabs = st.tabs(["Markdown", "HTML", "DocTags", "JSON", "Template Fill"])
-
-    with tabs[0]:
-        st.download_button(
-            "Download .md",
-            data=md.encode("utf-8"),
-            file_name=f"{Path(uploaded.name).stem}.md",
-            mime="text/markdown",
-        )
+    st.session_state["doc_md"] = md
+    st.session_state["doc_name"] = Path(uploaded.name).stem
+    st.success(f"Document processed. Pages: {len(result.pages)} | Status: {result.status}")
+    with st.expander("Preview extracted Markdown"):
         st.markdown(md)
 
-    with tabs[1]:
-        st.download_button(
-            "Download .html",
-            data=html.encode("utf-8"),
-            file_name=f"{Path(uploaded.name).stem}.html",
-            mime="text/html",
-        )
-        # Render a preview inside an iframe-like container
-        st.components.v1.html(html, height=600, scrolling=True)
+# Chat section
+st.header("💬 Chat With Your Document")
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
 
-    with tabs[2]:
-        st.download_button(
-            "Download .doctags.txt",
-            data=doctags.encode("utf-8"),
-            file_name=f"{Path(uploaded.name).stem}.doctags.txt",
-            mime="text/plain",
-        )
-        st.text_area("DocTags preview", doctags, height=300)
+if st.session_state.get("doc_md"):
+    # Show a tiny status line
+    used_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini") if os.getenv("OPENAI_API_KEY") else os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+    st.caption(f"Context: {st.session_state.get('doc_name','(no name)')} — Model: {used_model}")
 
-    with tabs[3]:
-        st.download_button(
-            "Download .json",
-            data=json_text.encode("utf-8"),
-            file_name=f"{Path(uploaded.name).stem}.json",
-            mime="application/json",
-        )
-        st.code(json_text, language="json")
+    for m in st.session_state["messages"]:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-    # Template-based JSON filling (AI via OpenRouter, with heuristic fallback)
-    with tabs[4]:
-        st.subheader("Fill JSON from Template (master.json)")
-
-        # Template source selection
-        template_choice = st.radio(
-            "Template source",
-            ["Use project master.json", "Upload custom template"],
-            horizontal=True,
-        )
-        template_bytes = None
-        template_path = Path(__file__).resolve().parent / "master.json"
-        if template_choice == "Use project master.json":
-            if not template_path.exists():
-                st.error("master.json not found in project directory.")
-                st.stop()
-            template_bytes = template_path.read_bytes()
-        else:
-            t_upload = st.file_uploader("Upload a JSON template", type=["json"], key="tpl_upload")
-            if t_upload is None:
-                st.info("Upload a template JSON to proceed.")
-                st.stop()
-            template_bytes = t_upload.getvalue()
-
-        try:
-            template = json.loads(template_bytes.decode("utf-8"))
-        except Exception as e:
-            st.error(f"Invalid template JSON: {e}")
-            st.stop()
-
-        # Prepare source: use generated Markdown for extraction
-        md_source = md
-
-        method_options = ["AI (OpenRouter)", "Heuristic (regex)"]
-        has_key = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
-        default_index = 0 if has_key else 1
-        method = st.radio("Filling method", method_options, index=default_index, horizontal=True)
-
-        if method == "AI (OpenRouter)":
-            if not has_key:
-                st.warning("OPENROUTER_API_KEY not set. Using heuristic fallback.")
-                filled = fill_template_from_text(template, md_source)
-            else:
-                with st.spinner("Asking AI to map Markdown to template via OpenRouter…"):
-                    try:
-                        filled = ai_fill_template_via_openrouter_from_markdown(template, md_source)
-                    except Exception as e:
-                        st.error(f"AI filling failed: {type(e).__name__}: {e}")
-                        st.info("Falling back to heuristic method.")
-                        filled = fill_template_from_text(template, md_source)
-        else:
-            filled = fill_template_from_text(template, md_source)
-
-        filled_text = json.dumps(filled, ensure_ascii=False, indent=2)
-
-        st.download_button(
-            "Download filled template .json",
-            data=filled_text.encode("utf-8"),
-            file_name=f"{Path(uploaded.name).stem}_filled.json",
-            mime="application/json",
-        )
-        st.code(filled_text, language="json")
-
-    st.caption(
-        "Tip: If you see Windows cache warnings or permission errors from Hugging Face Hub, enable Windows Developer Mode or run Streamlit as Administrator."
-    )
+    temperature_chat = st.slider("Chat temperature", 0.0, 1.0, 0.0, 0.1, key="chat_temp")
+    prompt = st.chat_input("Ask a question about the uploaded document…")
+    if prompt:
+        st.session_state["messages"].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                try:
+                    answer, provider = ai_chat_answer_with_fallback(st.session_state["doc_md"], prompt, temperature_chat)
+                    st.session_state["messages"].append({"role": "assistant", "content": answer + f"\n\n_(provider: {provider})_"})
+                    st.markdown(answer + f"\n\n_(provider: {provider})_")
+                except Exception as e:
+                    err = f"Chat failed: {type(e).__name__}: {e}"
+                    st.session_state["messages"].append({"role": "assistant", "content": err})
+                    st.error(err)
+    st.button("Clear chat", on_click=lambda: st.session_state.update({"messages": []}))
 else:
-    st.info("Upload a file to begin.")
+    st.info("Upload and process a document from the sidebar to start chatting.")
+
+st.caption(
+    "Tip: For very large documents, use lower temperature and rely on direct citations to keep answers grounded."
+)
